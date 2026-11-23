@@ -1,0 +1,97 @@
+name: Publish customer APK
+
+on:
+  push:
+    branches: ['apk-transfer/**']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: customer-apk-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TRANSFER_REF: ${{ github.ref_name }}
+      TRANSFER_SHA: ${{ github.sha }}
+      GH_REPO: ${{ github.repository }}
+      ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install APK verification tools
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'build-tools;36.0.0'
+      - name: Verify APK and prepare public assets
+        id: apk
+        shell: bash
+        run: |
+          [[ "$TRANSFER_REF" =~ ^apk-transfer/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))/[0-9]+-[0-9]+$ ]]
+          tag=${BASH_REMATCH[1]}
+          version=${tag#v}
+          code=$(jq -er '.version_code | select(type == "number" and floor == . and . >= 1 and . <= 2100000000)' incoming/version.json)
+          app_id=com.ultimate.pos.selfcheckout
+          mkdir dist
+          apk=dist/Onyx_Self_Checkout.apk
+          cat incoming/apk.part.* > "$apk"
+          checksum=$(sha256sum "$apk" | cut -d ' ' -f 1)
+          jq -ce --arg tag "$tag" --arg app "$app_id" --arg version "$version" --arg checksum "$checksum" \
+            'select(.tag == $tag and .application_id == $app and .version_name == $version and .apk_sha256 == $checksum) | {tag,application_id,version_name,version_code,apk_sha256}' \
+            incoming/version.json > dist/version.json
+
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          identity=$("$tools/aapt" dump badging "$apk" | grep '^package:')
+          [[ "$identity" == "package: name='$app_id' versionCode='$code' versionName='$version'"* ]]
+          "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/apk-cert.txt"
+          actual=$(awk '/^Signer #[0-9]+ certificate SHA-256 digest:/ { print toupper($NF) }' "$RUNNER_TEMP/apk-cert.txt")
+          expected=${ANDROID_CERT_SHA256//:/}
+          [[ "$expected" =~ ^[[:xdigit:]]{64}$ && "$actual" == "${expected^^}" ]] || { echo 'Unexpected APK signing certificate'; exit 1; }
+          printf '%s  Onyx_Self_Checkout.apk\n' "$checksum" > dist/SHA256SUMS
+          printf 'tag=%s\ncode=%s\n' "$tag" "$code" >> "$GITHUB_OUTPUT"
+      - name: Publish or verify the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.apk.outputs.tag }}
+          VERSION_CODE: ${{ steps.apk.outputs.code }}
+        run: |
+          cd dist
+          verify_release() {
+            local fetched
+            fetched=$(mktemp -d)
+            gh release download "$TAG" --dir "$fetched" -p Onyx_Self_Checkout.apk -p SHA256SUMS -p version.json
+            (cd "$fetched" && sha256sum --check SHA256SUMS)
+            cmp SHA256SUMS "$fetched/SHA256SUMS"
+            cmp version.json "$fetched/version.json"
+          }
+
+          if release=$(gh release view "$TAG" --json isDraft) && [[ $(jq -r .isDraft <<< "$release") == false ]]; then
+            verify_release
+            exit 0
+          fi
+
+          latest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+          if [[ -n "$latest" ]]; then
+            current=$(gh release download "$latest" -p version.json --output - | jq -er '.version_code | numbers')
+            (( VERSION_CODE > current )) || { echo 'The public Android build number must increase'; exit 1; }
+          fi
+
+          if [[ -z "$release" ]]; then
+            gh release create "$TAG" --draft --target main --title "Onyx Self-Checkout $TAG" \
+              --notes 'Official Android APK. Download Onyx_Self_Checkout.apk from Assets.'
+          fi
+          gh release upload "$TAG" Onyx_Self_Checkout.apk SHA256SUMS version.json --clobber
+          verify_release
+          gh release edit "$TAG" --draft=false --latest
+      - name: Remove the completed transfer branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref="repos/$GH_REPO/git/refs/heads/$TRANSFER_REF"
+          [[ $(gh api "$ref" --jq .object.sha) == "$TRANSFER_SHA" ]]
+          gh api --method DELETE "$ref"
