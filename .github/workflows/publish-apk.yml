@@ -61,17 +61,26 @@ jobs:
           VERSION_CODE: ${{ steps.apk.outputs.code }}
         run: |
           cd dist
+          versioned="Onyx_Self_Checkout_$TAG.apk"
+          cp Onyx_Self_Checkout.apk "$versioned"
+          fetched=$(mktemp -d)
           verify_release() {
-            local fetched
-            fetched=$(mktemp -d)
             gh release download "$TAG" --dir "$fetched" -p Onyx_Self_Checkout.apk -p SHA256SUMS -p version.json
             (cd "$fetched" && sha256sum --check SHA256SUMS)
             cmp SHA256SUMS "$fetched/SHA256SUMS"
             cmp version.json "$fetched/version.json"
           }
+          verify_versioned_apk() {
+            gh release download "$TAG" --dir "$fetched" -p "$versioned"
+            cmp Onyx_Self_Checkout.apk "$fetched/$versioned"
+          }
 
-          if release=$(gh release view "$TAG" --json isDraft) && [[ $(jq -r .isDraft <<< "$release") == false ]]; then
+          if release=$(gh release view "$TAG" --json isDraft,assets) && [[ $(jq -r .isDraft <<< "$release") == false ]]; then
             verify_release
+            if ! jq -e --arg name "$versioned" '.assets | any(.name == $name)' <<< "$release" >/dev/null; then
+              gh release upload "$TAG" "$versioned"
+            fi
+            verify_versioned_apk
             exit 0
           fi
 
@@ -83,10 +92,11 @@ jobs:
 
           if [[ -z "$release" ]]; then
             gh release create "$TAG" --draft --target main --title "Onyx Self-Checkout $TAG" \
-              --notes 'Official Android APK. Download Onyx_Self_Checkout.apk from Assets.'
+              --notes "Official Android APK. Download $versioned from Assets."
           fi
-          gh release upload "$TAG" Onyx_Self_Checkout.apk SHA256SUMS version.json --clobber
+          gh release upload "$TAG" Onyx_Self_Checkout.apk "$versioned" SHA256SUMS version.json --clobber
           verify_release
+          verify_versioned_apk
           gh release edit "$TAG" --draft=false --latest
       - name: Remove the completed transfer branch
         env:
